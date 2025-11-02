@@ -1,0 +1,277 @@
+这绝对是更优选的方案。“旁路由”模式（也称“旁路网关”或“单臂路由”）网络结构更清晰，没有双重 NAT，性能更好，是家庭网络中添加“服务型”路由（如去广告、IPTV、科学上网）的标准做法。
+
+下面是为您量身定制的、完整的**旁路由模式 IPTV 网关**设置指南。
+
+-----
+
+### **OpenWrt "IPTV 旁路由" 完整配置指南**
+
+#### **1. 目标与网络拓扑**
+
+  * **目标**：将 OpenWrt 路由器作为“IPTV 旁路由”，使其在主路由 `192.168.0.x` 网段内提供 `igmpproxy` 和 `udpxy` 服务。
+  * **主路由 (192.168.0.1)**：负责家中所有设备的 DHCP、Wi-Fi 和主要上网功能。
+  * **OpenWrt 旁路由 (192.168.0.2)**：
+      * **`LAN 1` 口**：连接到**主路由**的 `LAN` 口，用于管理和提供服务。
+      * **`LAN 2` 口**：连接到**光猫**的 `IPTV` 专用口，用于接收信号。
+      * **`WAN` 口**：**不使用**。
+  * **所有设备 (电脑, 机顶盒)**：**全部连接到主路由**的 `LAN` 口或 Wi-Fi。
+
+#### **2. 关键前提（开始前必读）**
+
+1.  **临时连接**：在开始配置前，**您必须将电脑直连到 OpenWrt 路由器的 `LAN 1` 口**，并确保您能通过 `192.168.1.1`（或您当前的 `lan` 口 IP）访问 LuCI 界面。
+2.  **IP 规划**：请确保 `192.168.0.2` 这个 IP **没有**被您主路由上的其他设备占用。（您可以在主路由的 DHCP 设置中将 `192.168.0.2` 到 `192.168.0.10` 设为“静态 IP 保留区”）。
+3.  **软件包**：确保已安装 `igmpproxy` 和 `luci-app-udpxy`。
+
+-----
+
+#### **3. 详细配置步骤 (LuCI 界面)**
+
+**步骤一：配置交换机 (VLAN 物理隔离)**
+
+  * 这一步与您之前的方案**完全相同**，目的是物理分离 `LAN 1` 和 `LAN 2`。
+  * 前往 `网络` -\> `交换机`。
+  * 确保配置如下：
+      * **VLAN 1 (LAN 区)**：`CPU (eth0): 已标记`，`LAN 1: 未标记`，`LAN 2: 关`，`WAN: 关`
+      * **VLAN 2 (WAN 区)**：`CPU (eth0): 已标记`，`LAN 1: 关`，`LAN 2: 关`，`WAN: 未标记`
+      * **VLAN 3 (IPTV 区)**：`CPU (eth0): 已标记`，`LAN 1: 关`，`LAN 2: 未标记`，`WAN: 关`
+  * 点击 `保存并应用`。
+
+**步骤二：配置 `lan` 接口 (旁路由核心)**
+
+1.  前往 `网络` -\> `接口`，找到 `lan` 接口，点击 `修改`。
+2.  **`常规设置`** 选项卡：
+      * `协议`：`静态地址`
+      * `IPv4 地址`：**`192.168.0.2`** (OpenWrt 的新 IP)
+      * `IPv4 子网掩码`：`255.255.255.0`
+      * `IPv4 网关`：**`192.168.0.1`** (您主路由的 IP)
+      * `DNS 服务器`：**`192.168.0.1`** (或 `223.5.5.5` 等公共 DNS)
+3.  **`DHCP 服务器`** 选项卡：
+      * 在 `常规设置` 下，**勾选 `忽略此接口`**。
+      * **解释**：关闭 OpenWrt 的 DHCP，防止与主路由冲突。
+4.  **`物理设置`** 选项卡：
+      * `设备`: 确保为 `eth0.1` (VLAN 1)。
+5.  点击 `保存` (先**不要**点击 `保存并应用`)。
+
+**步骤三：配置 `IPTV` 接口**
+
+1.  前往 `网络` -\> `接口`。
+2.  **创建接口** (如果已存在，请检查配置)：
+      * `名称`: **`IPTV`** (注意大小写)
+      * `协议`: `DHCP 客户端`
+      * `设备`: **`eth0.3`** (VLAN 3)
+3.  **编辑 `IPTV` 接口**：
+      * **`高级设置`** 选项卡：**取消勾选** `使用默认网关`，`跃点` 填 `20`。
+      * **`防火墙设置`** 选项卡：分配新区域 **`iptv`** (注意小写，与接口名 `IPTV` 不同没关系，但要保持一致)。
+4.  点击 `保存`。
+
+**步骤四：删除 `wan` 接口**
+
+  * 在 `网络` -\> `接口` 页面，找到 `wan` 和 `wan6` 接口。
+  * 点击 `删除`，因为旁路由模式不需要它们。
+
+**步骤五：配置 `igmpproxy`**
+
+  * 通过 SSH 登录，编辑 `vi /etc/config/igmpproxy`，确保内容如下 (注意 `IPTV` 和 `lan` 的大小写)：
+    ```ini
+    config igmpproxy
+        option quickleave 1
+
+    config phyint
+        option network 'IPTV'
+        option direction 'upstream'
+        list altnet '0.0.0.0/0'
+
+    config phyint
+        option network 'lan'
+        option direction 'downstream'
+    ```
+  * 执行 `/etc/init.d/igmpproxy restart && /etc/init.d/igmpproxy enable`。
+
+**步骤六：配置 `udpxy`**
+
+1.  前往 `服务` -\> `udpxy`。
+2.  `绑定 IP / 接口`: **`192.168.0.2`** (OpenWrt 的新 `lan` IP)。
+3.  `端口`: `4022`
+4.  `源 IP / 接口`: **`eth0.3`**
+5.  `保存`。
+
+**步骤七：配置防火墙 (关键)**
+
+1.  前往 `网络` -\> `防火墙`。
+2.  **删除 `wan` 区域**：在 `区域` 部分，找到 `wan` 区域，点击 `删除`。
+3.  **修改 `iptv` 区域** (这是与上个方案**最关键的区别**)：
+      * `入站数据`: `接受`
+      * `出站数据`: `接受`
+      * `区域内转发`: `拒绝`
+      * `IP 动态伪装`: **勾选** (用于点播/EPG)。
+      * `MSS 钳制`: **勾选**。
+      * `允许转发到目标区域`: **选择 `lan`** (不再是 `wan`)。
+      * **解释**：现在 `lan` 区（`192.168.0.x`）是互联网的唯一出口，IPTV 点播流量需要被允许转发到 `lan` 区，才能通过主路由（`192.168.0.1`）访问互联网。
+4.  **修改 `通信规则`**：
+      * **`Allow-IGMP`**: 保持不变 (源 `iptv` -\> 目标 `设备`)。
+      * **`Allow-Multicast`**: 保持不变 (源 `iptv` -\> 目标 `lan`)。
+      * **`Allow-udpxy-LAN`**: 保持不变 (源 `lan` -\> 目标 `设备`，端口 `4022`)。
+      * **`Allow-udpxy-WAN`**: **这条规则现在已无用，请删除它**。
+5.  点击 `保存`。
+
+**步骤八：应用配置并切换网络**
+
+1.  **检查所有配置**，尤其是 `lan` 接口的 IP (`192.168.0.2`) 和 `忽略 DHCP`。
+2.  点击页面右上角的 `未保存的配置`，然后点击 **`保存并应用`**。
+3.  **您将立即失去与 `192.168.1.1` 的连接**。这是正常的！
+4.  **切换物理连接**：
+      * 将您的电脑网线从 OpenWrt `LAN 1` 口拔出，**插回您的主路由**。
+      * 确保您的 OpenWrt `LAN 1` 口已连接到主路由的 `LAN` 口。
+      * (OpenWrt `LAN 2` 口保持连接光猫)。
+
+-----
+
+#### **5. 验证与使用**
+
+1.  **验证管理**：
+      * 在您的电脑（现已连回主路由）上，打开浏览器。
+      * 访问 OpenWrt 的新地址：**`http://192.168.0.2`**，您应该能看到 LuCI 登录界面。
+2.  **验证服务**：
+      * 访问 `udpxy` 状态页：**`http://192.168.0.2:4022/status`**。
+      * 您应该能看到 `udpxy status` 页面。
+3.  **使用 (PC/手机)**：
+      * 在 Potplayer 中使用新地址：
+        `http://192.168.0.2:4022/rtp/[组播地址]:[端口]`
+4.  **使用 (机顶盒)**：
+      * 将**运营商机顶盒**也**插入主路由的 `LAN` 口**。
+      * `igmpproxy` 会自动代理其组播请求，机顶盒应能正常播放。
+
+-----
+
+### **附录：旁路由模式一键配置脚本**
+
+**前提**：
+
+1.  **必须**先在 LuCI 中**手动完成“步骤一：配置交换机”**。
+2.  **必须**已安装 `igmpproxy` 和 `luci-app-udpxy`。
+3.  **警告**：运行此脚本将**立即改变** OpenWrt 的 `lan` 口 IP 并重启网络，您将从 `192.168.1.1` 断开连接。
+
+通过 SSH (在 `192.168.1.1`) 粘贴并运行以下脚本：
+
+```sh
+#!/bin/sh
+
+# ===================================================================
+# OpenWrt "IPTV 旁路由" 一键配置脚本
+# 警告：运行此脚本将改变 LAN IP 至 192.168.0.2 并导致您断开连接！
+# ===================================================================
+
+echo "--- 步骤 1: 检查 VLAN 设备 ---"
+if [ ! -d "/sys/class/net/eth0.1" ] || [ ! -d "/sys/class/net/eth0.3" ]; then
+    echo "错误：未找到 'eth0.1' (LAN) 或 'eth0.3' (IPTV) 设备。"
+    echo "请先在 '网络 -> 交换机' 页面手动配置好 VLAN 1 和 3。"
+    echo "脚本已终止。"
+    exit 1
+fi
+echo "VLAN 检查通过！"
+sleep 2
+
+echo "--- 步骤 2: 配置 'lan' 接口 (旁路由核心) ---"
+uci set network.lan.device='eth0.1'
+uci set network.lan.proto='static'
+uci set network.lan.ipaddr='192.168.0.2'
+uci set network.lan.netmask='255.255.255.0'
+uci set network.lan.gateway='192.168.0.1'
+uci set network.lan.dns='192.168.0.1'
+uci -q delete network.lan.ip6assign
+uci -q delete network.lan.delegate
+
+echo "--- 步骤 3: 关闭 'lan' 接口的 DHCP ---"
+uci set dhcp.lan.ignore='1'
+
+echo "--- 步骤 4: 删除 'wan' 接口和区域 ---"
+uci -q delete network.wan
+uci -q delete network.wan6
+uci -q delete firewall.wan
+
+echo "--- 步骤 5: 配置 'IPTV' 接口 ---"
+uci -q delete network.IPTV
+uci set network.IPTV='interface'
+uci set network.IPTV.proto='dhcp'
+uci set network.IPTV.device='eth0.3'
+uci set network.IPTV.defaultroute='0'
+uci set network.IPTV.metric='20'
+
+echo "--- 步骤 6: 配置 igmpproxy ---"
+uci -q delete igmpproxy.igmpproxy
+uci set igmpproxy.igmpproxy='igmpproxy'
+uci set igmpproxy.igmpproxy.quickleave='1'
+while uci -q delete igmpproxy.@phyint[0]; do :; done
+uci add igmpproxy phyint
+uci set igmpproxy.@phyint[-1].network='IPTV'
+uci set igmpproxy.@phyint[-1].direction='upstream'
+uci add_list igmpproxy.@phyint[-1].altnet='0.0.0.0/0'
+uci add igmpproxy phyint
+uci set igmpproxy.@phyint[-1].network='lan'
+uci set igmpproxy.@phyint[-1].direction='downstream'
+
+echo "--- 步骤 7: 配置 udpxy ---"
+uci set udpxy.udpxy.disabled='0'
+uci set udpxy.udpxy.status='1'
+uci set udpxy.udpxy.bind='192.168.0.2'
+uci set udpxy.udpxy.port='4022'
+uci set udpxy.udpxy.source='eth0.3'
+
+echo "--- 步骤 8: 配置防火墙 ---"
+# 配置 'iptv' 区域，允许转发到 'lan'
+uci -q delete firewall.iptv # 使用小写的 iptv 区域名
+uci set firewall.iptv='zone'
+uci set firewall.iptv.name='iptv'
+uci set firewall.iptv.input='ACCEPT'
+uci set firewall.iptv.output='ACCEPT'
+uci set firewall.iptv.forward='REJECT'
+uci set firewall.iptv.masq='1'
+uci set firewall.iptv.mtu_fix='1'
+uci add_list firewall.iptv.network='IPTV'
+uci add_list firewall.iptv.forwarding_to='lan' # 关键！转发到 lan
+
+# 清理旧的通信规则
+uci -q delete firewall.Allow_IGMP
+uci -q delete firewall.Allow_Multicast
+uci -q delete firewall.Allow_udpxy_LAN
+uci -q delete firewall.Allow_udpxy_WAN # 删除不再需要的 WAN 规则
+
+# 添加通信规则
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-IGMP'
+uci set firewall.@rule[-1].src='iptv'
+uci set firewall.@rule[-1].proto='igmp'
+uci set firewall.@rule[-1].target='INPUT'
+
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-Multicast'
+uci set firewall.@rule[-1].src='iptv'
+uci set firewall.@rule[-1].dest='lan'
+uci set firewall.@rule[-1].proto='udp'
+uci set firewall.@rule[-1].dest_ip='224.0.0.0/4'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-udpxy-LAN'
+uci set firewall.@rule[-1].src='lan'
+uci set firewall.@rule[-1].dest_port='4022'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].target='INPUT'
+
+echo "--- 步骤 9: 提交配置并重启服务 ---"
+uci commit
+
+echo "配置已提交！网络服务将在 5 秒后重启。"
+echo "您将从 192.168.1.1 断开连接。"
+echo "请将电脑连接回主路由，然后通过 http://192.168.0.2 访问。"
+sleep 5
+
+/etc/init.d/network restart
+/etc/init.d/firewall restart
+/etc/init.d/igmpproxy enable
+/etc/init.d/igmpproxy restart
+/etc/init.d/udpxy enable
+/etc/init.d/udpxy restart
+
+echo "--- 脚本执行完毕 ---"
+```
