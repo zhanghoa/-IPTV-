@@ -1,0 +1,152 @@
+#!/bin/sh
+
+#
+# ===================================================================
+# OpenWrt IPTV 网关一键配置脚本 (双NAT / WAN口访问方案)
+# ===================================================================
+#
+
+echo "--- 步骤 1: 检查关键的 VLAN 设备 ---"
+
+# 检查 eth0.1 (LAN) 是否存在
+if [ ! -d "/sys/class/net/eth0.1" ]; then
+    echo "错误：未找到 'eth0.1' (LAN) 设备。"
+    echo "请先在 '网络 -> 交换机' 页面配置 VLAN 1 (CPU 标记, LAN 1 未标记)。"
+    echo "脚本已终止。"
+    exit 1
+fi
+
+# 检查 eth0.2 (WAN) 是否存在
+if [ ! -d "/sys/class/net/eth0.2" ]; then
+    echo "错误：未找到 'eth0.2' (WAN) 设备。"
+    echo "请先在 '网络 -> 交换机' 页面配置 VLAN 2 (CPU 标记, WAN 未标记)。"
+    echo "脚本已终止。"
+    exit 1
+fi
+
+# 检查 eth0.3 (IPTV) 是否存在
+if [ ! -d "/sys/class/net/eth0.3" ]; then
+    echo "错误：未找到 'eth0.3' (IPTV) 设备。"
+    echo "请先在 '网络 -> 交换机' 页面配置 VLAN 3 (CPU 标记, LAN 2 未标记)。"
+    echo "脚本已终止。"
+    exit 1
+fi
+
+echo "VLAN 检查通过！eth0.1, eth0.2, eth0.3 均已找到。"
+echo "--- 准备开始配置... ---"
+sleep 2
+
+echo "--- 步骤 2: 安装软件包 ---"
+opkg update
+opkg install igmpproxy luci-app-udpxy
+
+echo "--- 步骤 3: 正在配置网络接口 ---"
+# 配置 lan 和 wan 接口使用正确的VLAN设备
+uci set network.lan.device='eth0.1'
+uci set network.wan.device='eth0.2'
+uci set network.wan.proto='dhcp' # 确保WAN口从主路由获取IP
+
+# 创建 IPTV 接口
+uci -q delete network.IPTV
+uci set network.IPTV='interface'
+uci set network.IPTV.proto='dhcp'
+uci set network.IPTV.device='eth0.3'
+uci set network.IPTV.defaultroute='0'
+uci set network.IPTV.metric='20'
+
+echo "--- 步骤 4: 正在配置 igmpproxy ---"
+# 清理旧的配置
+uci -q delete igmpproxy.igmpproxy
+uci set igmpproxy.igmpproxy='igmpproxy'
+uci set igmpproxy.igmpproxy.quickleave='1'
+while uci -q delete igmpproxy.@phyint[0]; do :; done
+# 添加上游 (IPTV 接口)
+uci add igmpproxy phyint
+uci set igmpproxy.@phyint[-1].network='IPTV' # 注意大小写与接口名一致
+uci set igmpproxy.@phyint[-1].direction='upstream'
+uci add_list igmpproxy.@phyint[-1].altnet='0.0.0.0/0'
+# 添加下游 (lan 接口)
+uci add igmpproxy phyint
+uci set igmpproxy.@phyint[-1].network='lan'
+uci set igmpproxy.@phyint[-1].direction='downstream'
+
+echo "--- 步骤 5: 正在配置 udpxy ---"
+uci set udpxy.udpxy.disabled='0'
+uci set udpxy.udpxy.status='1'
+uci set udpxy.udpxy.bind='0.0.0.0' # 监听所有IP，包括WAN口的 192.168.0.13
+uci set udpxy.udpxy.port='4022'
+uci set udpxy.udpxy.source='eth0.3'
+
+echo "--- 步骤 6: 正在配置防火墙 ---"
+# 1. 配置 IPTV 防火墙区域
+uci -q delete firewall.IPTV
+uci set firewall.IPTV='zone'
+uci set firewall.IPTV.name='IPTV' # 注意大小写
+uci set firewall.IPTV.input='ACCEPT'
+uci set firewall.IPTV.output='ACCEPT'
+uci set firewall.IPTV.forward='REJECT'
+uci set firewall.IPTV.masq='1'
+uci set firewall.IPTV.mtu_fix='1'
+uci add_list firewall.IPTV.network='IPTV'
+uci add_list firewall.IPTV.forwarding_to='wan'
+
+# 2. 删除可能存在的旧规则（防止重复）
+uci -q delete firewall.Allow_IGMP
+uci -q delete firewall.Allow_Multicast
+uci -q delete firewall.Allow_udpxy_LAN
+uci -q delete firewall.Allow_udpxy_WAN
+
+# 3. 添加防火墙通信规则
+# 规则 1: Allow-IGMP
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-IGMP'
+uci set firewall.@rule[-1].src='IPTV'
+uci set firewall.@rule[-1].proto='igmp'
+uci set firewall.@rule[-1].target='INPUT'
+
+# 规则 2: Allow-Multicast (UDP)
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-Multicast'
+uci set firewall.@rule[-1].src='IPTV'
+uci set firewall.@rule[-1].dest='lan'
+uci set firewall.@rule[-1].proto='udp'
+uci set firewall.@rule[-1].dest_ip='224.0.0.0/4'
+uci set firewall.@rule[-1].target='ACCEPT'
+
+# 规则 3: Allow-udpxy-LAN (从lan口访问)
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-udpxy-LAN'
+uci set firewall.@rule[-1].src='lan'
+uci set firewall.@rule[-1].dest_port='4022'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].target='INPUT'
+
+# 规则 4: Allow-udpxy-WAN (从wan口访问，关键！)
+uci add firewall rule
+uci set firewall.@rule[-1].name='Allow-udpxy-WAN'
+uci set firewall.@rule[-1].src='wan'
+uci set firewall.@rule[-1].dest_port='4022'
+uci set firewall.@rule[-1].proto='tcp'
+uci set firewall.@rule[-1].target='INPUT'
+
+echo "--- 步骤 7: 提交所有配置 ---"
+uci commit network
+uci commit igmpproxy
+uci commit udpxy
+uci commit firewall
+
+echo "--- 步骤 8: 重启服务 ---"
+/etc/init.d/network restart
+/etc/init.d/firewall restart
+/etc/init.d/igmpproxy enable
+/etc/init.d/igmpproxy restart
+/etc/init.d/udpxy enable
+/etc/init.d/udpxy restart
+
+echo ""
+echo "==================================================================="
+echo "--- 所有配置已完成！---"
+echo "您的 OpenWrt IPTV 路由器已配置完毕。"
+echo "请从主路由的 192.168.0.x 网段访问 http://[OpenWrt的WAN口IP]:4022/status"
+echo "==================================================================="
+echo "--- 脚本执行完毕 ---"
